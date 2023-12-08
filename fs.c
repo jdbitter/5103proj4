@@ -44,15 +44,17 @@ union fs_block
 
 // TRUE  -> inode is free
 // FALSE -> inode is used
+bool* freeInodesBitMap;
+
 bool* freeBlockBitMap;
 
 int findOpenINode() {
   union fs_block block;
   disk_read(0, block.data);
-  for (int i = 0; i < block.super.ninodes; i++) {
-    if (freeBlockBitMap[i] == true) {
-      return i;
-    }
+  for (int i = 0; block.super.ninodes; i++) {
+    if (freeInodesBitMap[i] == true) {
+        return i;
+      }
   }
   return -1;
 }
@@ -71,6 +73,7 @@ void fs_debug() {
   printf("    %d inodes\n", block.super.ninodes);
 
   for (int i = 1; i < 1 + totalInodeBlocks; i++) {
+    printf("__inode block %d__\n", i);
     disk_read(i, block.data);
     for (int j = 0; j < INODES_PER_BLOCK; j++) {
       if (block.inode[j].isvalid == 1) {
@@ -130,19 +133,19 @@ int fs_mount() {
     return 0;
   }
 
-  // create bitmap
-  freeBlockBitMap = (bool*) malloc(super.super.ninodes * sizeof(bool));
-  if (freeBlockBitMap == NULL) {
+  // create inodebitmap
+  freeInodesBitMap = (bool*) malloc(super.super.ninodes * sizeof(bool));
+  if (freeInodesBitMap == NULL) {
     printf("malloc error\n");
     return 0;
   }
 
-  //initialize bitmap
+  //initialize inodebitmap
   for (int i = 1; i <= super.super.ninodeblocks; i++) {
     union fs_block block;
     disk_read(i, block.data);
     for (int j = 0; j < INODES_PER_BLOCK; j++) {
-      freeBlockBitMap[(i-1)*128+j] = (block.inode[j].isvalid == 0);
+      freeInodesBitMap[(i-1)*128+j] = (block.inode[j].isvalid == 0);
     }
   }
   return 1;
@@ -167,6 +170,7 @@ int fs_create() {
   union fs_block block;
   int inodeBlock = 1 + inodeNumber / INODES_PER_BLOCK;
   int inodePosition = inodeNumber % INODES_PER_BLOCK;
+  disk_read(inodeBlock, block.data);
   block.inode[inodePosition].isvalid = 1;
   block.inode[inodePosition].size = 0;
   for (int i = 0; i < POINTERS_PER_INODE; i++) {
@@ -174,18 +178,40 @@ int fs_create() {
   }
   block.inode[inodePosition].indirect = 0;
   disk_write(inodeBlock, block.data);
-  freeBlockBitMap[inodePosition] = false;
+  freeInodesBitMap[inodeNumber] = false;
   return inodePosition;
 }
 
-int fs_delete(int inumber)
-{
+int fs_delete(int inumber) {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+  if (block.inode[inodePosition].isvalid == 0) {
+    printf("error, nothing to delete\n");
     return 0;
+  }
+  block.inode[inodePosition].isvalid = 0;
+  block.inode[inodePosition].size = 0;
+  for (int i = 0; i < POINTERS_PER_INODE; i++) {
+    block.inode[inodePosition].direct[i] = 0;
+  }
+  block.inode[inodePosition].indirect = 0;
+  disk_write(inodeBlock, block.data);
+  freeInodesBitMap[inumber] = true;
+  return 1;
 }
 
-int fs_getsize(int inumber)
-{
+int fs_getsize(int inumber) {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+  if (block.inode[inodePosition].isvalid == 0) {
+    printf("error, inode doesn't exist\n");
     return -1;
+  }
+  return block.inode[inodePosition].size;
 }
 
 int fs_read(int inumber, char *data, int length, int offset)
