@@ -1,102 +1,225 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <errno.h>
-#include <string.h>
-
+#include "fs.h"
 #include "disk.h"
 
-#define DISK_MAGIC 0xdeadbeef
+#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <errno.h>
+#include <unistd.h>
 
-static FILE *diskfile;
-static int nblocks = 0;
-static int nreads = 0;
-static int nwrites = 0;
+#define FS_MAGIC 0xf0f03410
+#define INODES_PER_BLOCK 128
+#define POINTERS_PER_INODE 5
+#define POINTERS_PER_BLOCK 1024
 
-int disk_init(const char *filename, int n)
+// Returns the number of dedicated inode blocks given the disk size in blocks
+#define NUM_INODE_BLOCKS(disk_size_in_blocks) (1 + (disk_size_in_blocks / 10))
+
+struct fs_superblock
 {
-    diskfile = fopen(filename, "r+");
-    if (!diskfile)
-        diskfile = fopen(filename, "w+");
-    if (!diskfile)
-        return 0;
+    int magic;        // Magic bytes
+    int nblocks;      // Size of the disk in number of blocks
+    int ninodeblocks; // Number of blocks dedicated to inodes
+    int ninodes;      // Number of dedicated inodes
+};
 
-    ftruncate(fileno(diskfile), n * DISK_BLOCK_SIZE);
+struct fs_inode
+{
+    int isvalid;                    // 1 if valid (in use), 0 otherwise
+    int size;                       // Size of file in bytes
+    int direct[POINTERS_PER_INODE]; // Direct data block numbers (0 if invalid)
+    int indirect;                   // Indirect data block number (0 if invalid)
+};
 
-    nblocks = n;
-    nreads = 0;
-    nwrites = 0;
+union fs_block
+{
+    struct fs_superblock super;              // Superblock
+    struct fs_inode inode[INODES_PER_BLOCK]; // Block of inodes
+    int pointers[POINTERS_PER_BLOCK];        // Indirect block of direct data block numbers
+    char data[DISK_BLOCK_SIZE];              // Data block
+};
 
+
+// TRUE  -> inode is free
+// FALSE -> inode is used
+bool* freeInodesBitMap;
+
+bool* freeBlockBitMap;
+
+int findOpenINode() {
+  union fs_block block;
+  disk_read(0, block.data);
+  for (int i = 0; block.super.ninodes; i++) {
+    if (freeInodesBitMap[i] == true) {
+        return i;
+      }
+  }
+  return -1;
+}
+
+
+void fs_debug() {
+  union fs_block block;
+
+  disk_read(0, block.data);
+
+  int totalInodeBlocks = block.super.ninodeblocks;
+
+  printf("superblock:\n");
+  printf("    %d blocks\n", block.super.nblocks);
+  printf("    %d inode blocks\n", block.super.ninodeblocks);
+  printf("    %d inodes\n", block.super.ninodes);
+
+  for (int i = 1; i < 1 + totalInodeBlocks; i++) {
+    printf("__inode block %d__\n", i);
+    disk_read(i, block.data);
+    for (int j = 0; j < INODES_PER_BLOCK; j++) {
+      if (block.inode[j].isvalid == 1) {
+        printf("inode %d:\n", (i-1)*128+j);
+        printf("    size: %d bytes\n", block.inode[j].size);
+        bool atLeastOne = false;
+        for (int k = 0; k < POINTERS_PER_INODE; k++) {
+          if (block.inode[j].direct[k] != 0) {
+            if (!atLeastOne) {
+              printf("    direct blocks: ");
+              atLeastOne = true;
+            }
+            printf("%d ", block.inode[j].direct[k]);
+          }
+        }
+        if (atLeastOne) {
+          printf("\n");
+        }
+        if (block.inode[j].indirect != 0) {
+          printf("    indirect block: %d\n", block.inode[j].indirect);
+          printf("    indirect data blocks: %d %d %d ...\n", block.inode[j].indirect+1, block.inode[j].indirect+2, block.inode[j].indirect+3);
+        }
+      }
+    }
+  }
+}
+
+// DONE (?)
+int fs_format() {
+  // erase all data currently on disk
+  union fs_block empty;
+  // not sure if this is the way to create a empty block
+  for (int i = 0; i < DISK_BLOCK_SIZE; i++) {
+    empty.data[i] = 0;
+  }
+  for (int i = 0; i < disk_size(); i++) {
+    disk_write(i, empty.data);
+  }
+  union fs_block block;
+
+  // put superblock info into disk
+  block.super.magic = FS_MAGIC;
+  block.super.nblocks = disk_size();
+  block.super.ninodeblocks = NUM_INODE_BLOCKS(disk_size());
+  block.super.ninodes = block.super.ninodeblocks * INODES_PER_BLOCK;
+  disk_write(0, block.data);
+  return 1;
+}
+
+
+int fs_mount() {
+  // check that superblock is formatted
+  union fs_block super;
+  disk_read(0, super.data);
+  if (super.super.magic != FS_MAGIC) {
+    printf("superblock not initialized\n");
+    return 0;
+  }
+
+  // create inodebitmap
+  freeInodesBitMap = (bool*) malloc(super.super.ninodes * sizeof(bool));
+  if (freeInodesBitMap == NULL) {
+    printf("malloc error\n");
+    return 0;
+  }
+
+  //initialize inodebitmap
+  for (int i = 1; i <= super.super.ninodeblocks; i++) {
+    union fs_block block;
+    disk_read(i, block.data);
+    for (int j = 0; j < INODES_PER_BLOCK; j++) {
+      freeInodesBitMap[(i-1)*128+j] = (block.inode[j].isvalid == 0);
+    }
+  }
+  return 1;
+}
+
+int fs_unmount() {
+    if (freeBlockBitMap == NULL) {
+      printf("unmount error, bitmap already freed\n");
+      return 0;
+    }
+    free(freeBlockBitMap);
+    freeBlockBitMap = NULL;
     return 1;
 }
 
-int disk_size()
-{
-    return nblocks;
+int fs_create() {
+  int inodeNumber = findOpenINode();
+  if (inodeNumber == -1) {
+    printf("fail, no free inodes");
+    return -1;
+  }
+  union fs_block block;
+  int inodeBlock = 1 + inodeNumber / INODES_PER_BLOCK;
+  int inodePosition = inodeNumber % INODES_PER_BLOCK;
+  disk_read(inodeBlock, block.data);
+  block.inode[inodePosition].isvalid = 1;
+  block.inode[inodePosition].size = 0;
+  for (int i = 0; i < POINTERS_PER_INODE; i++) {
+      block.inode[inodePosition].direct[i] = 0;
+  }
+  block.inode[inodePosition].indirect = 0;
+  disk_write(inodeBlock, block.data);
+  freeInodesBitMap[inodeNumber] = false;
+  return inodePosition;
 }
 
-static void sanity_check(int blocknum, const void *data)
-{
-    if (blocknum < 0)
-    {
-        printf("ERROR: blocknum (%d) is negative!\n", blocknum);
-        abort();
-    }
-
-    if (blocknum >= nblocks)
-    {
-        printf("ERROR: blocknum (%d) is too big!\n", blocknum);
-        abort();
-    }
-
-    if (!data)
-    {
-        printf("ERROR: null data pointer!\n");
-        abort();
-    }
+int fs_delete(int inumber) {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+  if (block.inode[inodePosition].isvalid == 0) {
+    printf("error, nothing to delete\n");
+    return 0;
+  }
+  block.inode[inodePosition].isvalid = 0;
+  block.inode[inodePosition].size = 0;
+  for (int i = 0; i < POINTERS_PER_INODE; i++) {
+    block.inode[inodePosition].direct[i] = 0;
+  }
+  block.inode[inodePosition].indirect = 0;
+  disk_write(inodeBlock, block.data);
+  freeInodesBitMap[inumber] = true;
+  return 1;
 }
 
-void disk_read(int blocknum, char *data)
-{
-    sanity_check(blocknum, data);
-
-    fseek(diskfile, blocknum * DISK_BLOCK_SIZE, SEEK_SET);
-
-    if (fread(data, DISK_BLOCK_SIZE, 1, diskfile) == 1)
-    {
-        nreads++;
-    }
-    else
-    {
-        printf("ERROR: couldn't access simulated disk: %s\n", strerror(errno));
-        abort();
-    }
+int fs_getsize(int inumber) {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+  if (block.inode[inodePosition].isvalid == 0) {
+    printf("error, inode doesn't exist\n");
+    return -1;
+  }
+  return block.inode[inodePosition].size;
 }
 
-void disk_write(int blocknum, const char *data)
+int fs_read(int inumber, char *data, int length, int offset)
 {
-    sanity_check(blocknum, data);
-
-    fseek(diskfile, blocknum * DISK_BLOCK_SIZE, SEEK_SET);
-
-    if (fwrite(data, DISK_BLOCK_SIZE, 1, diskfile) == 1)
-    {
-        nwrites++;
-    }
-    else
-    {
-        printf("ERROR: couldn't access simulated disk: %s\n", strerror(errno));
-        abort();
-    }
+    return 0;
 }
 
-void disk_close()
+int fs_write(int inumber, const char *data, int length, int offset)
 {
-    if (diskfile)
-    {
-        printf("%d disk block reads\n", nreads);
-        printf("%d disk block writes\n", nwrites);
-        fclose(diskfile);
-        diskfile = 0;
-    }
+    return 0;
 }
