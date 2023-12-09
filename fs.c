@@ -123,7 +123,7 @@ int fs_format() {
   return 1;
 }
 
-
+// indirect still needs to be finished
 int fs_mount() {
   // check that superblock is formatted
   union fs_block super;
@@ -140,12 +140,35 @@ int fs_mount() {
     return 0;
   }
 
-  //initialize inodebitmap
+  // create blockbitmap
+  freeBlockBitMap = (bool*) malloc((super.super.nblocks - super.super.ninodeblocks - 1) * sizeof(bool));
+  if (freeBlockBitMap == NULL) {
+    printf("malloc error\n");
+    return 0;
+  }
+
+  //initialize maps
+  // start all data blocks as free
+  for (int i = 0; i < super.super.nblocks - super.super.ninodeblocks - 1; i++) {
+    freeBlockBitMap[i] = true;
+  }
   for (int i = 1; i <= super.super.ninodeblocks; i++) {
     union fs_block block;
     disk_read(i, block.data);
     for (int j = 0; j < INODES_PER_BLOCK; j++) {
       freeInodesBitMap[(i-1)*128+j] = (block.inode[j].isvalid == 0);
+      // inode is in use, check direct/indirect
+      if (!freeInodesBitMap[(i-1)*128+j]) {
+        for (int k = 0; k < POINTERS_PER_INODE; k++) {
+          if (block.inode[j].direct[k] != 0) {
+            freeBlockBitMap[block.inode[j].direct[k] - super.super.ninodeblocks - 1] = false;
+          }
+        }
+        if (block.inode[j].indirect != 0) {
+          freeBlockBitMap[block.inode[j].indirect - super.super.ninodeblocks - 1] = false;
+          // what other blocks does this include???
+        }
+      }
     }
   }
   return 1;
@@ -153,11 +176,17 @@ int fs_mount() {
 
 int fs_unmount() {
     if (freeBlockBitMap == NULL) {
-      printf("unmount error, bitmap already freed\n");
+      printf("unmount error, blockbitmap already freed\n");
+      return 0;
+    }
+    if (freeInodesBitMap == NULL) {
+      printf("unmount error, inodebitmap already freed\n");
       return 0;
     }
     free(freeBlockBitMap);
+    free(freeInodesBitMap);
     freeBlockBitMap = NULL;
+    freeInodesBitMap = NULL;
     return 1;
 }
 
@@ -187,16 +216,34 @@ int fs_delete(int inumber) {
   int inodePosition = inumber % INODES_PER_BLOCK;
   union fs_block block;
   disk_read(inodeBlock, block.data);
+  union fs_block super;
+  disk_read(0, super.data);
+  union fs_block empty;
+  for (int i = 0; i < DISK_BLOCK_SIZE; i++) {
+    empty.data[i] = 0;
+  }
   if (block.inode[inodePosition].isvalid == 0) {
     printf("error, nothing to delete\n");
     return 0;
   }
   block.inode[inodePosition].isvalid = 0;
   block.inode[inodePosition].size = 0;
+
+  // clear out direct array
   for (int i = 0; i < POINTERS_PER_INODE; i++) {
-    block.inode[inodePosition].direct[i] = 0;
+    if (block.inode[inodePosition].direct[i] != 0) {
+      freeBlockBitMap[block.inode[inodePosition].direct[i] - super.super.ninodeblocks - 1] = true;
+      disk_write(block.inode[inodePosition].direct[i], empty.data);
+      block.inode[inodePosition].direct[i] = 0;
+    }
   }
-  block.inode[inodePosition].indirect = 0;
+
+  // clear out indirect
+  if (block.inode[inodePosition].indirect != 0) {
+    freeBlockBitMap[block.inode[inodePosition].indirect - super.super.ninodeblocks - 1] = true;
+    disk_write(block.inode[inodePosition].indirect, empty.data);
+    block.inode[inodePosition].indirect = 0;
+  }
   disk_write(inodeBlock, block.data);
   freeInodesBitMap[inumber] = true;
   return 1;
