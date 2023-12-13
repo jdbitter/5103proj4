@@ -76,6 +76,7 @@ void fs_debug() {
     printf("__inode block %d__\n", i);
     disk_read(i, block.data);
     for (int j = 0; j < INODES_PER_BLOCK; j++) {
+      //printf("inode %d (isvalid = %d):\n", (i-1)*128+j, block.inode[j].isvalid);
       if (block.inode[j].isvalid == 1) {
         printf("inode %d:\n", (i-1)*128+j);
         printf("    size: %d bytes\n", block.inode[j].size);
@@ -94,9 +95,38 @@ void fs_debug() {
         }
         if (block.inode[j].indirect != 0) {
           printf("    indirect block: %d\n", block.inode[j].indirect);
-          printf("    indirect data blocks: %d %d %d ...\n", block.inode[j].indirect+1, block.inode[j].indirect+2, block.inode[j].indirect+3);
+          printf("    indirect data blocks: ");
+          union fs_block indirect;
+          disk_read(block.inode[j].indirect, indirect.data);
+          for (int z = 0; z < POINTERS_PER_BLOCK; z++) {
+            if (indirect.pointers[z] != 0) {
+              printf(" %d", indirect.pointers[z]);
+            }
+          }
+          // printf("    indirect data blocks: %d %d %d ...\n", block.inode[j].indirect+1, block.inode[j].indirect+2, block.inode[j].indirect+3);
+          printf("\n");
         }
       }
+    }
+  }
+   disk_read(0, block.data);
+   printf("__FreeInodeBitMap__\n");
+   for (int i = 0; i < block.super.ninodeblocks * INODES_PER_BLOCK; i++) {
+     if (freeInodesBitMap[i]) {
+      // printf("inode %d: Free\n", i);
+     }
+     else {
+       printf("inode %d: In Use\n", i);
+     }
+   }
+
+  printf("__FreeBlockBitMap__\n");
+  for (int i = 0; i < block.super.nblocks - block.super.ninodeblocks - 1; i++) {
+    if (freeBlockBitMap[i]) {
+      //printf("%d: Free\n", i+1+block.super.ninodeblocks);
+    }
+    else {
+      printf("%d: In Use\n", i+1+block.super.ninodeblocks);
     }
   }
 }
@@ -167,6 +197,13 @@ int fs_mount() {
         if (block.inode[j].indirect != 0) {
           freeBlockBitMap[block.inode[j].indirect - super.super.ninodeblocks - 1] = false;
           // what other blocks does this include???
+          union fs_block indirect;
+          disk_read(block.inode[j].indirect, indirect.data);
+          for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
+            if (indirect.pointers[i] != 0) {
+              freeBlockBitMap[indirect.pointers[i] - super.super.ninodeblocks - 1] = false;
+            }
+          }
         }
       }
     }
@@ -240,6 +277,14 @@ int fs_delete(int inumber) {
 
   // clear out indirect
   if (block.inode[inodePosition].indirect != 0) {
+    union fs_block indirect;
+    disk_read(block.inode[inodePosition].indirect, indirect.data);
+    for (int i = 0; i < POINTERS_PER_BLOCK; i++) {
+      if (indirect.pointers[i] != 0) {
+        freeBlockBitMap[indirect.pointers[i]] = true;
+        disk_write(indirect.pointers[i], empty.data);
+      }
+    }
     freeBlockBitMap[block.inode[inodePosition].indirect - super.super.ninodeblocks - 1] = true;
     disk_write(block.inode[inodePosition].indirect, empty.data);
     block.inode[inodePosition].indirect = 0;
@@ -261,11 +306,68 @@ int fs_getsize(int inumber) {
   return block.inode[inodePosition].size;
 }
 
-int fs_read(int inumber, char *data, int length, int offset)
-{
+int fs_read(int inumber, char *data, int length, int offset) {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+  // check that inode is valid
+  if (block.inode[inodePosition].isvalid == 0) {
+    printf("error, inode doesn't exist\n");
     return 0;
+  }
+  // check if inode has data at offset
+  if (offset > fs_getsize(inumber)) {
+    printf("error, offset is larger then inode size\n");
+    return 0;
+  }
+  // not efficient to do it this one byte at a time, don't know how important that is
+  for (int i = 0; i < length; i++) {
+    // check if out of data to read
+    if (fs_getsize(inumber) < offset+i) {
+      //printf("ran out of data to read, returning early\n");
+      return i-1;
+    }
+    union fs_block blockData;
+    int dataBlock = (offset+i) / DISK_BLOCK_SIZE;   // the ith data block of this inode, not the actual data block position
+    int dataPosition = (offset+i) % DISK_BLOCK_SIZE;
+    //   dataBlock is in direct block
+    union fs_block super;
+    disk_read(0, super.data);
+    if (dataBlock < 5) {
+      // double check that this block is not free
+      if (freeBlockBitMap[block.inode[inodePosition].direct[dataBlock]-1-super.super.ninodeblocks]) {
+        printf("error, data block %d not initialized\n", block.inode[inodePosition].direct[dataBlock]);
+        return i;
+      }
+    disk_read(block.inode[inodePosition].direct[dataBlock], blockData.data);
+    data[i] = blockData.data[dataPosition];
+    }
+    // dataBlock is in indirect
+    else {
+      // double check that indirect block exists
+      if (block.inode[inodePosition].indirect == 0) {
+        printf("error, indirect data block doesn't exist\n");
+        return i;
+      }
+      union fs_block indirect;
+      disk_read(block.inode[inodePosition].indirect, indirect.data);
+      // double check that the pointer exists
+      if (indirect.pointers[dataBlock-5] == 0) {
+        printf("error, indirect pointer doesnt exist\n");
+        return i;
+      }
+      // checks that the data block that is pointed to is not free
+      if (freeBlockBitMap[indirect.pointers[dataBlock-5]-1-super.super.ninodeblocks]) {
+        printf("error, indirectly linked data block isn't initialized\n");
+        return i;
+      }
+      disk_read(indirect.pointers[dataBlock-5], blockData.data);
+      data[i] = blockData.data[dataPosition];
+    }
+  }
+  return length;
 }
-
 int fs_write(int inumber, const char *data, int length, int offset)
 {
     return 0;
