@@ -59,6 +59,29 @@ int findOpenINode() {
   return -1;
 }
 
+int findOpenBlock() {
+  union fs_block block;
+  disk_read(0, block.data);
+  for (int i = 0; i < block.super.nblocks - block.super.ninodeblocks; i++) {
+    if (freeBlockBitMap[i] == true) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+int findOpenIndirectBlock() {
+  union fs_block block;
+  disk_read(0, block.data);
+  for (int i = block.super.nblocks - block.super.ninodeblocks; i < block.super.nblocks; i++) {
+    if (freeBlockBitMap[i] == true) {
+      return i;
+    }
+  }
+
+  return -1;
+}
 
 void fs_debug() {
   union fs_block block;
@@ -370,5 +393,43 @@ int fs_read(int inumber, char *data, int length, int offset) {
 }
 int fs_write(int inumber, const char *data, int length, int offset)
 {
+  int inodeBlock = 1 + inumber / INODES_PER_BLOCK;
+  int inodePosition = inumber % INODES_PER_BLOCK;
+
+  union fs_block block;
+  disk_read(inodeBlock, block.data);
+
+  //check that offset isn't greater than total size
+  if (offset > fs_getsize(inumber)) {
+    printf("error, offset is larger then inode size\n");
     return 0;
+  }
+
+  for (int i = 0 ; i < length; i++) {
+    if (fs_getsize(inumber) < offset + i) {
+      return i - 1;
+    }
+    int dataBlock = (offset+i) / DISK_BLOCK_SIZE;   // the ith data block of this inode, not the actual data block position
+    int dataPosition = (offset+i) % DISK_BLOCK_SIZE;
+    union fs_block super;
+    union fs_block indirect;
+    
+    disk_read(0, super.data);
+    //direct block
+    if (dataBlock < 5) {
+      // double check that this block is not free
+      if (freeBlockBitMap[block.inode[inodePosition].direct[dataBlock]-1-super.super.ninodeblocks]) {
+        int newBlock = findOpenBlock();
+        block.inode[inodePosition].direct[dataBlock] = newBlock;
+        freeBlockBitMap[newBlock] = false;
+      }
+      disk_write(block.inode[inodePosition].direct[dataBlock], data);
+    } else { //indirect block
+        4; // not done yet
+      
+    }
+
+  }
+
+  return length;
 }
